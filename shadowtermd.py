@@ -1,7 +1,10 @@
 #!/usr/bin/python
+from typing import List
 from bcc import BPF
+
 import collections
 import ctypes
+import logging
 import os
 
 
@@ -14,7 +17,7 @@ class WriteData(ctypes.Structure):
 
 class MarkerData(ctypes.Structure):
     _fields_ = [
-        ("start", ctypes.c_int),
+        ("type", ctypes.c_int),
     ]
 
 
@@ -37,12 +40,18 @@ class EventData(ctypes.Structure):
 TMP_DIR = "/tmp/shadowterm"
 
 
+"""
+Enter: ioctl(x, TCSETSW, ECHO)
+Exit: last TIOCSPGRP before tty_read
+"""
+
 bpf_text = """
 #include <uapi/linux/ptrace.h>
 #include <linux/fs.h>
 #include <linux/tty.h>
 #include <linux/sched/signal.h>
 
+BPF_HASH(session_state, int, int);
 BPF_PERF_OUTPUT(events);
 
 // BPF stack size limit of 512
@@ -54,7 +63,7 @@ struct write_data_t {
 };
 
 struct marker_data_t {
-    int start; // bool
+    int type;
 };
 
 enum event_type {
@@ -73,45 +82,7 @@ struct event_data_t {
     };
 };
 
-int handle_readline_enter(struct pt_regs *ctx) {
-    int tgid = bpf_get_current_pid_tgid() >> 32;
-    struct task_struct *cur = (struct task_struct *)bpf_get_current_task();
-    int id = cur->signal->tty->session->numbers[0].nr;
-
-    struct event_data_t data = {
-        .tgid = tgid,
-        .id = id,
-        .type = MARKER_EVENT,
-        .marker_data = {
-            .start = 1,
-        },
-    };
-
-    events.perf_submit(ctx, &data, sizeof(data));
-
-    return 0;
-}
-
-int handle_readline_ret(struct pt_regs *ctx) {
-    int tgid = bpf_get_current_pid_tgid() >> 32;
-    struct task_struct *cur = (struct task_struct *)bpf_get_current_task();
-    int id = cur->signal->tty->session->numbers[0].nr;
-
-    struct event_data_t data = {
-        .tgid = tgid,
-        .id = id,
-        .type = MARKER_EVENT,
-        .marker_data = {
-            .start = 0,
-        },
-    };
-
-    events.perf_submit(ctx, &data, sizeof(data));
-
-    return 0;
-}
-
-int handle_tty_write(struct pt_regs *ctx, struct file *file, const char *buf, size_t count) {
+int kprobe__tty_write(struct pt_regs *ctx, struct file *file, const char *buf, size_t count) {
     if (file->f_inode->i_ino == _DAEMON_TTY_INODE_) {
         return 0;
     }
@@ -137,7 +108,90 @@ int handle_tty_write(struct pt_regs *ctx, struct file *file, const char *buf, si
     return 0;
 }
 
-int handle_exit(struct pt_regs *ctx) {
+int kprobe__tty_mode_ioctl(struct pt_regs *ctx, struct tty_struct *tty, struct file *file, unsigned int cmd, unsigned long arg) {
+    int tgid = bpf_get_current_pid_tgid() >> 32;
+    struct task_struct *cur = (struct task_struct *)bpf_get_current_task();
+    int id = cur->signal->tty->session->numbers[0].nr;
+
+    if (tgid == id && cmd == TCSETSW) {
+        struct termios t;
+        bpf_probe_read_user(&t, sizeof(t), (void*)arg);
+
+        if (t.c_lflag & ECHO) {
+            int state = 1;
+            session_state.update(&id, &state);
+
+            struct event_data_t data = {
+                .tgid = tgid,
+                .id = id,
+                .type = MARKER_EVENT,
+                .marker_data = {
+                    .type = 0,
+                },
+            };
+            events.perf_submit(ctx, &data, sizeof(data));
+        }
+    }
+
+    return 0;
+}
+
+int kprobe__tty_jobctrl_ioctl(struct pt_regs *ctx, struct tty_struct *tty, struct tty_struct *real_tty, struct file *file, unsigned int cmd, unsigned long arg) {
+    int tgid = bpf_get_current_pid_tgid() >> 32;
+    struct task_struct *cur = (struct task_struct *)bpf_get_current_task();
+    int id = cur->signal->tty->session->numbers[0].nr;
+
+    if (tgid == id && cmd == TIOCSPGRP) {
+        int new_pgrp;
+        bpf_probe_read_user(&new_pgrp, sizeof(new_pgrp), (int*)arg);
+
+        if (tgid == new_pgrp) {
+            struct event_data_t data = {
+                .tgid = tgid,
+                .id = id,
+                .type = MARKER_EVENT,
+                .marker_data = {
+                    .type = 1,
+                }
+            };
+            events.perf_submit(ctx, &data, sizeof(data));
+        }
+    }
+
+    return 0;
+}
+
+int kprobe__tty_read(struct pt_regs *ctx, struct file *file, const char *buf, size_t count, loff_t *ppos) {
+    if (file->f_inode->i_ino == _DAEMON_TTY_INODE_) {
+        return 0;
+    }
+
+    int tgid = bpf_get_current_pid_tgid() >> 32;
+
+    struct tty_struct *tty = ((struct tty_file_private *)file->private_data)->tty;
+    int id = tty->session->numbers[0].nr;
+
+    if (session_state.lookup(&id) == NULL) {
+        return 0;
+    }
+
+    session_state.delete(&id);
+
+    struct event_data_t data = {
+        .tgid = tgid,
+        .id = id,
+        .type = MARKER_EVENT,
+        .marker_data = {
+            .type = 2,
+        },
+    };
+
+    events.perf_submit(ctx, &data, sizeof(data));
+
+    return 0;
+}
+
+int kprobe__do_group_exit(struct pt_regs *ctx) {
     int tgid = bpf_get_current_pid_tgid() >> 32;
     struct event_data_t data = {
         .tgid = tgid,
@@ -150,20 +204,17 @@ int handle_exit(struct pt_regs *ctx) {
 
 bpf_text = bpf_text.replace('_DAEMON_TTY_INODE_', str(os.stat("/proc/self/fd/1").st_ino))
 
-b = BPF(text=bpf_text)
-b.attach_kprobe(event="tty_write", fn_name="handle_tty_write")
-b.attach_kprobe(event="do_group_exit", fn_name="handle_exit")
 
-SHELL = "/bin/bash"
-b.attach_uprobe(name=SHELL, sym="readline", fn_name="handle_readline_enter")
-b.attach_uretprobe(name=SHELL, sym="readline", fn_name="handle_readline_ret")
+class SessionState(object):
+    is_writing: bool
+    cmd_offsets: List[int]
 
-
-if not os.path.exists(TMP_DIR):
-    os.makedirs(TMP_DIR)
+    def __init__(self):
+        self.is_writing = False
+        self.cmd_offsets = [0]
 
 
-session_is_writing = collections.defaultdict(lambda: False)
+session_states = collections.defaultdict(lambda: SessionState())
 
 
 def handle_event(cpu, data, size):
@@ -171,21 +222,49 @@ def handle_event(cpu, data, size):
     session_fn_base = os.path.join(TMP_DIR, str(event.id))
 
     if event.type == 0:
-        session_is_writing[event.id] = not event.data.marker_data.start
-        if session_is_writing[event.id]:
-            try:
-                os.rename(f"{session_fn_base}-1", f"{session_fn_base}-0")
-            except Exception:
-                pass
+        # Marker
+        marker_type = event.data.marker_data.type
+        state = session_states[event.id]
+
+        if marker_type == 0:
+            logging.debug("%d: Start marker received", event.id)
+            state.is_writing = True
+
+        elif marker_type == 1:
+            with open(f"{session_fn_base}-1", 'ab') as f:
+                logging.debug("%d: (Potentially) intermediate shell process group set leader. Marking output at %d", event.id, f.tell())
+                session_states[event.id].cmd_offsets.append(f.tell())
+
+        elif marker_type == 2:
+            with open(f"{session_fn_base}-1", 'ab') as f:
+                end_of_cmds = session_states[event.id].cmd_offsets[-1]
+                logging.debug("%d: tty_read. Truncating output to %d", event.id, end_of_cmds)
+                f.truncate(end_of_cmds)
+
+            logging.debug("%d: Renaming current log to 0", event.id)
+            os.rename(f"{session_fn_base}-1", f"{session_fn_base}-0")
+
+            session_states[event.id].is_writing = False
+
+        else:
+            logging.warning("Unknown marker type %d received for session %d from TGID %d", marker_type, event.id, event.tgid)
 
     elif event.type == 1:
-        if session_is_writing[event.id]:
+        # Write data
+        if session_states[event.id].is_writing:
             buf = event.data.write_data.buf[0:event.data.write_data.count]
+
+            logging.debug("%d: Data received (len = %d): %s", event.id, event.data.write_data.count, buf)
+
             with open(f"{session_fn_base}-1", 'ab') as f:
                 f.write(buf)
+                f.flush()
 
     elif event.type == 2:
-        if event.tgid in session_is_writing:
+        # Exit
+        if event.tgid in session_states:
+            logging.debug("%d: Exit received, cleaning up", event.id)
+
             try:
                 os.unlink(f"{event.tgid}-0")
             except Exception:
@@ -195,9 +274,18 @@ def handle_event(cpu, data, size):
             except Exception:
                 pass
 
+    else:
+        logging.warning("Unknown event type %d", event.type)
 
-b["events"].open_perf_buffer(handle_event)
 
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.DEBUG)
 
-while 1:
-    b.perf_buffer_poll()
+    if not os.path.exists(TMP_DIR):
+        os.makedirs(TMP_DIR)
+
+    b = BPF(text=bpf_text)
+    b["events"].open_perf_buffer(handle_event)
+
+    while 1:
+        b.perf_buffer_poll()
