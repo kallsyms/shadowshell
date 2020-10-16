@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/env python3
 from typing import List
 from bcc import BPF
 
@@ -6,6 +6,9 @@ import collections
 import ctypes
 import logging
 import os
+import sys
+
+from config import TMP_DIR
 
 
 class WriteData(ctypes.Structure):
@@ -35,9 +38,6 @@ class EventData(ctypes.Structure):
         ("type", ctypes.c_int),
         ("data", EventDataUnion),
     ]
-
-
-TMP_DIR = "/tmp/shadowterm"
 
 
 """
@@ -279,10 +279,21 @@ def handle_event(cpu, data, size):
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.DEBUG)
+    logging.basicConfig(level=logging.INFO)
+
+    if len(sys.argv) > 1 and sys.argv[1] == "-v":
+        logging.basicConfig(level=logging.DEBUG)
 
     if not os.path.exists(TMP_DIR):
         os.makedirs(TMP_DIR)
+
+    # BCC does some stuff that makes it hard to trap KeyboardInterrupt
+    def excepthook(exctype, value, traceback):
+        if exctype == KeyboardInterrupt:
+            sys.exit(0)
+        else:
+            sys.__excepthook__(exctype, value, traceback)
+    sys.excepthook = excepthook
 
     b = BPF(text=bpf_text)
     b["events"].open_perf_buffer(handle_event)

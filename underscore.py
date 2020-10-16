@@ -1,7 +1,9 @@
+#!/usr/bin/env python3
 import os
 import sys
 
-TMP_DIR = "/tmp/shadowterm"
+from config import TMP_DIR
+
 sid = os.getsid(0)
 fn = os.path.join(TMP_DIR, f"{sid}-0")
 
