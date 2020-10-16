@@ -1,1 +1,1 @@
-TMP_DIR = "/tmp/shadowterm"
+TMP_DIR = "/tmp/shadowshell"
